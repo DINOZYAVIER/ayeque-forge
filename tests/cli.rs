@@ -56,6 +56,32 @@ fn init_is_idempotent_outside_git() {
 }
 
 #[test]
+fn init_uses_the_exact_directory_and_preserves_an_invalid_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "--initial-branch=main"]);
+    let nested = temp.path().join("nested/workspace");
+    fs::create_dir_all(&nested).unwrap();
+
+    let output = forge().arg("init").arg(&nested).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!temp.path().join("FORGE.toml").exists());
+    assert_eq!(
+        fs::read(nested.join("FORGE.toml")).unwrap(),
+        b"format = 1\n"
+    );
+
+    let invalid = b"format = 2\n";
+    fs::write(nested.join("FORGE.toml"), invalid).unwrap();
+    let failed = forge().arg("init").arg(&nested).output().unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(nested.join("FORGE.toml")).unwrap(), invalid);
+}
+
+#[test]
 fn lock_materializes_two_entities_and_preserves_old_lock_on_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
@@ -118,6 +144,69 @@ path = "one"
         .unwrap();
     assert!(!failed.status.success());
     assert_eq!(fs::read(workspace.join("FORGE.lock")).unwrap(), lock);
+}
+
+#[test]
+fn lock_reresolves_a_moving_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    create_source(&source);
+    fs::write(
+        workspace.join("FORGE.toml"),
+        format!(
+            r#"format = 1
+
+[[entity]]
+id = "moving"
+kind = "test"
+schema = "1"
+git = "{}"
+revision = "main"
+path = "one"
+"#,
+            source.display()
+        ),
+    )
+    .unwrap();
+    let data = temp.path().join("data");
+    let first = forge()
+        .arg("lock")
+        .current_dir(&workspace)
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_lock = fs::read_to_string(workspace.join("FORGE.lock")).unwrap();
+
+    fs::write(source.join("one/value.txt"), "changed\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "advance main"]);
+    let second = forge()
+        .arg("lock")
+        .current_dir(&workspace)
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_lock = fs::read_to_string(workspace.join("FORGE.lock")).unwrap();
+    assert_ne!(first_lock, second_lock);
+    assert!(
+        second_lock.contains(
+            String::from_utf8(git(&source, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+        )
+    );
 }
 
 #[test]

@@ -47,6 +47,7 @@ EOF
 )
 test "$(grep -c '^commit = ' "$workspace/FORGE.lock")" = 2
 old_lock="$(sha256sum "$workspace/FORGE.lock" | cut -d ' ' -f1)"
+echo "old lock sha256: $old_lock"
 sed -i 's/path = "two"/path = "missing"/' "$workspace/FORGE.toml"
 if (
     cd "$workspace"
