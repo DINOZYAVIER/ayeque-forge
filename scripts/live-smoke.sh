@@ -46,6 +46,11 @@ EOF
     XDG_DATA_HOME="$smoke_root/data" "$forge_bin" lock
 )
 test "$(grep -c '^commit = ' "$workspace/FORGE.lock")" = 2
+one_path="$(
+    cd "$workspace/nested"
+    XDG_DATA_HOME="$smoke_root/data" "$forge_bin" path one
+)"
+test "$(cat "$one_path/value.txt")" = "one"
 old_lock="$(sha256sum "$workspace/FORGE.lock" | cut -d ' ' -f1)"
 echo "old lock sha256: $old_lock"
 sed -i 's/path = "two"/path = "missing"/' "$workspace/FORGE.toml"
@@ -57,6 +62,13 @@ if (
     exit 1
 fi
 test "$(sha256sum "$workspace/FORGE.lock" | cut -d ' ' -f1)" = "$old_lock"
+if (
+    cd "$workspace"
+    XDG_DATA_HOME="$smoke_root/data" "$forge_bin" path one
+); then
+    echo "path unexpectedly accepted a stale lock" >&2
+    exit 1
+fi
 
 lfs_repo="$smoke_root/lfs-source"
 lfs_workspace="$smoke_root/lfs-workspace"

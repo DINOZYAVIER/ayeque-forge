@@ -131,6 +131,33 @@ path = "one"
     assert_eq!(text.matches("commit = ").count(), 2);
     assert_eq!(text.matches("tree = ").count(), 2);
 
+    let resolved = forge()
+        .args(["path", "first"])
+        .current_dir(&nested)
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .unwrap();
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let resolved = String::from_utf8(resolved.stdout).unwrap();
+    let resolved = Path::new(resolved.trim());
+    assert!(resolved.is_absolute());
+    assert_eq!(
+        fs::read_to_string(resolved.join("value.txt")).unwrap(),
+        "one\n"
+    );
+
+    let unknown = forge()
+        .args(["path", "unknown"])
+        .current_dir(&nested)
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+
     fs::write(
         workspace.join("FORGE.toml"),
         manifest.replace("path = \"two\"", "path = \"missing\""),
@@ -144,6 +171,15 @@ path = "one"
         .unwrap();
     assert!(!failed.status.success());
     assert_eq!(fs::read(workspace.join("FORGE.lock")).unwrap(), lock);
+
+    let stale = forge()
+        .args(["path", "first"])
+        .current_dir(&nested)
+        .env("XDG_DATA_HOME", &data)
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("is stale"));
 }
 
 #[test]
