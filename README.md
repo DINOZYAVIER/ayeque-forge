@@ -33,3 +33,12 @@ agl --function "$function_root" \
 since `lock`, the id is absent, or the materialized checkout is unavailable.
 Consumers receive explicit paths; they do not scan the Forge cache and do not
 need to understand `FORGE.toml` or `FORGE.lock`.
+
+This repository is a Forge workspace of itself. Its root `FORGE.toml`
+declares the `docs` and `tasks` entities against `main`, so after
+`ayeque-forge lock`:
+
+```sh
+docs_root="$(ayeque-forge path docs)"
+tasks_root="$(ayeque-forge path tasks)"
+```

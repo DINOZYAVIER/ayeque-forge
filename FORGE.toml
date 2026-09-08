@@ -1,0 +1,17 @@
+format = 1
+
+[[entity]]
+id = "docs"
+kind = "docs"
+schema = "1"
+git = "/home/dinozyavier/repos/ayeque-forge"
+revision = "main"
+path = "docs"
+
+[[entity]]
+id = "tasks"
+kind = "tasks"
+schema = "1"
+git = "/home/dinozyavier/repos/ayeque-forge"
+revision = "main"
+path = "tasks"
