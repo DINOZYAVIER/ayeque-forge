@@ -2,9 +2,7 @@
 
 ## Status
 
-Planned specification. The human selected this direction on 2026-09-09.
-Implementation is not authorized here. The intended implementer is Luna
-Medium.
+Accepted and implemented in `ayeque-forge` commit `3309233`.
 
 ## Human direction
 
