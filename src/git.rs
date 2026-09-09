@@ -139,7 +139,10 @@ pub(crate) fn ensure_checkout(
     commit: &str,
     repository: &Path,
 ) -> Result<PathBuf> {
-    let parent = data_root.join("checkouts").join(source_hash);
+    let parent = data_root
+        .join("git")
+        .join(".staging-checkouts")
+        .join(source_hash);
     fs::create_dir_all(&parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
     let checkout = parent.join(commit);

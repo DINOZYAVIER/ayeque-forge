@@ -9,20 +9,23 @@ use serde::{Deserialize, Serialize};
 use crate::git::{
     ensure_checkout, ensure_repository, fetch_lfs, fetch_revision, materialize_lfs, resolve_tree,
 };
-use crate::manifest::{
-    Manifest, Storage, parse_manifest, validate_artifact_path, validate_relative_path,
+use crate::manifest::{Manifest, parse_manifest, validate_relative_path};
+use crate::storage::{
+    atomic_write, data_root, ensure_layout, remove_internal_path_if_present, sha256_hex,
+    write_storage_root,
 };
-use crate::storage::{atomic_write, data_root, ensure_layout, sha256_hex};
 
 const MANIFEST_NAME: &str = "FORGE.toml";
 const LOCK_NAME: &str = "FORGE.lock";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LockFile {
     format: u32,
     manifest_sha256: String,
+    project_key: String,
+    workspace_sha256: String,
     entity: Vec<LockEntity>,
 }
 
@@ -50,35 +53,26 @@ pub fn init(path: Option<&Path>) -> Result<()> {
     let directory = directory
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", directory.display()))?;
-    let manifest_path = directory.join(MANIFEST_NAME);
-    let manifest = if manifest_path.exists() {
-        let bytes = fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let manifest = parse_manifest(&bytes, &manifest_path)?;
-        println!("already initialized {}", manifest_path.display());
-        manifest
-    } else {
-        let manifest = Manifest {
-            format: FORMAT,
-            storage: None,
-            entity: Vec::new(),
-        };
-        atomic_write(&manifest_path, b"format = 1\n")?;
-        println!("created {}", manifest_path.display());
-        manifest
-    };
-
-    let manifest_bytes = fs::read(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let storage = data_root_for(&directory, &manifest)?;
+    let storage = data_root()?;
     ensure_layout(&storage)?;
-    println!("storage {}", storage.display());
-
-    let lock_path = directory.join(LOCK_NAME);
+    let (project, project_key, workspace_sha) = ensure_project(&storage, &directory)?;
+    let manifest_path = project.join(MANIFEST_NAME);
+    if !manifest_path.exists() {
+        atomic_write(&manifest_path, format!("format = {FORMAT}\n").as_bytes())?;
+        println!("created {}", manifest_path.display());
+    } else {
+        let bytes = fs::read(&manifest_path)?;
+        parse_manifest(&bytes, &manifest_path)?;
+        println!("already initialized {}", manifest_path.display());
+    }
+    let manifest_bytes = fs::read(&manifest_path)?;
+    let lock_path = project.join(LOCK_NAME);
     if !lock_path.exists() {
         let lock = LockFile {
             format: FORMAT,
             manifest_sha256: format!("sha256:{}", sha256_hex(&manifest_bytes)),
+            project_key,
+            workspace_sha256: workspace_sha,
             entity: Vec::new(),
         };
         write_lock(&lock_path, &lock)?;
@@ -86,11 +80,12 @@ pub fn init(path: Option<&Path>) -> Result<()> {
     } else {
         println!("preserved {}", lock_path.display());
     }
+    println!("project {}", project.display());
     Ok(())
 }
 
 pub fn validate() -> Result<()> {
-    let (manifest_path, _workspace, manifest) = current_manifest()?;
+    let (manifest_path, workspace, manifest) = current_manifest()?;
     let manifest_bytes = fs::read(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let lock_path = manifest_path
@@ -110,6 +105,7 @@ pub fn validate() -> Result<()> {
         &lock,
         &lock_path,
         &manifest_path,
+        &workspace,
     )?;
     println!("validated {}", manifest_path.display());
     println!("validated {}", lock_path.display());
@@ -117,78 +113,130 @@ pub fn validate() -> Result<()> {
 }
 
 pub fn configure_storage_root(root: &Path) -> Result<()> {
-    let (manifest_path, workspace, mut manifest) = current_manifest()?;
-    let root = root
-        .to_str()
-        .ok_or_else(|| anyhow!("storage root must be valid UTF-8"))?;
-    validate_artifact_path(root)?;
-    manifest.storage = Some(Storage {
-        root: root.to_owned(),
-    });
-    write_manifest(&manifest_path, &manifest)?;
-    let data_root = data_root_for(&workspace, &manifest)?;
+    ensure!(root.is_absolute(), "storage root override must be absolute");
+    let _ = write_storage_root(root)?;
+    let data_root = root.to_path_buf();
     ensure_layout(&data_root)?;
     println!("configured storage {}", data_root.display());
     Ok(())
 }
 
-pub fn configure_artifact_path(id: &str, path: &Path) -> Result<()> {
-    ensure!(!id.is_empty(), "entity id must not be empty");
-    let (manifest_path, _workspace, mut manifest) = current_manifest()?;
-    let path = path
-        .to_str()
-        .ok_or_else(|| anyhow!("entity artifact path must be valid UTF-8"))?;
-    validate_artifact_path(path)?;
-    let entity = manifest
-        .entity
-        .iter_mut()
-        .find(|entity| entity.id == id)
-        .ok_or_else(|| {
-            anyhow!(
-                "entity {:?} is not present in {}",
-                id,
-                manifest_path.display()
-            )
-        })?;
-    entity.artifact = Some(path.to_owned());
-    write_manifest(&manifest_path, &manifest)?;
-    println!("configured artifact {} {}", id, path);
-    Ok(())
-}
-
 fn current_manifest() -> Result<(PathBuf, PathBuf, Manifest)> {
-    let current = env::current_dir().context("failed to read the current directory")?;
-    let manifest_path = find_manifest(&current)?;
-    let workspace = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", manifest_path.display()))?
-        .to_path_buf();
+    let workspace = discover_workspace(&env::current_dir()?)?;
+    let storage = data_root()?;
+    let (project, _, _) = existing_project(&storage, &workspace)?;
+    let manifest_path = project.join(MANIFEST_NAME);
     let bytes = fs::read(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let manifest = parse_manifest(&bytes, &manifest_path)?;
     Ok((manifest_path, workspace, manifest))
 }
 
-fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
-    let serialized = toml::to_string_pretty(manifest).context("failed to serialize FORGE.toml")?;
-    atomic_write(path, serialized.as_bytes())
+fn discover_workspace(start: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let value = String::from_utf8(output.stdout).context("git returned non-UTF-8 workspace")?;
+        return PathBuf::from(value.trim())
+            .canonicalize()
+            .context("failed to resolve Git workspace");
+    }
+    start
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", start.display()))
+}
+
+fn workspace_identity(workspace: &Path) -> String {
+    format!(
+        "sha256:{}",
+        sha256_hex(workspace.to_string_lossy().as_bytes())
+    )
+}
+
+fn project_basename(workspace: &Path) -> Result<String> {
+    workspace
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .filter(|value| {
+            !value.is_empty()
+                && value != "."
+                && value != ".."
+                && !value.contains(['/', '\0', '\n', '\r'])
+        })
+        .ok_or_else(|| anyhow!("workspace has no valid basename"))
+}
+
+fn ensure_project(storage: &Path, workspace: &Path) -> Result<(PathBuf, String, String)> {
+    fs::create_dir_all(storage.join("projects"))?;
+    let basename = project_basename(workspace)?;
+    let identity = workspace_identity(workspace);
+    let base = storage.join("projects").join(&basename);
+    for key in [
+        basename.clone(),
+        format!("{}-{}", basename, &identity[7..19]),
+        format!("{}-{}", basename, &identity[7..]),
+    ] {
+        let project = storage.join("projects").join(&key);
+        let marker = project.join("project.toml");
+        if project.exists() {
+            if marker.is_file() && fs::read_to_string(&marker)?.contains(&identity) {
+                fs::create_dir_all(project.join("entities"))?;
+                return Ok((project, key, identity));
+            }
+            continue;
+        }
+        fs::create_dir_all(project.join("entities"))?;
+        atomic_write(
+            &marker,
+            format!("format = 1\nworkspace_sha256 = \"{}\"\n", identity).as_bytes(),
+        )?;
+        return Ok((project, key, identity));
+    }
+    let _ = base;
+    bail!("could not allocate a unique Forge project key")
+}
+
+fn existing_project(storage: &Path, workspace: &Path) -> Result<(PathBuf, String, String)> {
+    let basename = project_basename(workspace)?;
+    let identity = workspace_identity(workspace);
+    for key in [
+        basename.clone(),
+        format!("{}-{}", basename, &identity[7..19]),
+        format!("{}-{}", basename, &identity[7..]),
+    ] {
+        let project = storage.join("projects").join(&key);
+        if project.join("project.toml").is_file()
+            && fs::read_to_string(project.join("project.toml"))?.contains(&identity)
+        {
+            return Ok((project, key, identity));
+        }
+    }
+    bail!("workspace is not initialized; run `ayeque-forge init`")
 }
 
 pub fn lock() -> Result<()> {
-    let current = env::current_dir().context("failed to read the current directory")?;
-    let manifest_path = find_manifest(&current)?;
-    let workspace = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", manifest_path.display()))?;
+    let workspace = discover_workspace(&env::current_dir()?)?;
+    let data_root = data_root()?;
+    let (project, project_key, workspace_sha) = existing_project(&data_root, &workspace)?;
+    let manifest_path = project.join(MANIFEST_NAME);
     let bytes = fs::read(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let mut manifest = parse_manifest(&bytes, &manifest_path)?;
-    let data_root = data_root_for(workspace, &manifest)?;
     ensure_layout(&data_root)?;
 
     manifest.entity.sort_by(|a, b| a.id.cmp(&b.id));
     let mut repositories = BTreeMap::<String, PathBuf>::new();
     let mut locked = Vec::with_capacity(manifest.entity.len());
+    let entities = project.join("entities");
+    let staged_entities = project.join(format!(".entities.staging-{}", std::process::id()));
+    remove_internal_path_if_present(&staged_entities, &project)?;
+    fs::create_dir_all(&staged_entities)?;
 
     for entity in manifest.entity {
         let source_hash = sha256_hex(entity.git.as_bytes());
@@ -213,12 +261,9 @@ pub fn lock() -> Result<()> {
             "materialized entity {:?} is not a directory",
             entity.id
         );
-        let materialized = match entity.artifact.as_deref() {
-            Some(path) => materialize_artifact(workspace, path, &checkout_entity)?,
-            None => checkout_entity,
-        };
-
-        println!("{}\t{}", entity.id, materialized.display());
+        let materialized = staged_entities.join(&entity.id);
+        fs::create_dir_all(&materialized)?;
+        copy_tree(&checkout_entity, &materialized)?;
         locked.push(LockEntity {
             id: entity.id,
             git: entity.git,
@@ -231,25 +276,38 @@ pub fn lock() -> Result<()> {
     let lock = LockFile {
         format: FORMAT,
         manifest_sha256: format!("sha256:{}", sha256_hex(&bytes)),
+        project_key,
+        workspace_sha256: workspace_sha,
         entity: locked,
     };
     let serialized = toml::to_string_pretty(&lock).context("failed to serialize FORGE.lock")?;
-    atomic_write(&workspace.join(LOCK_NAME), serialized.as_bytes())?;
+    let old_entities = project.join(format!(".entities.previous-{}", std::process::id()));
+    remove_internal_path_if_present(&old_entities, &project)?;
+    if entities.exists() {
+        fs::rename(&entities, &old_entities)?;
+    }
+    if let Err(error) = fs::rename(&staged_entities, &entities) {
+        if old_entities.exists() {
+            let _ = fs::rename(&old_entities, &entities);
+        }
+        return Err(error.into());
+    }
+    if old_entities.exists() {
+        fs::remove_dir_all(&old_entities)?;
+    }
+    atomic_write(&project.join(LOCK_NAME), serialized.as_bytes())?;
+    for entity in &lock.entity {
+        println!("{}\t{}", entity.id, entities.join(&entity.id).display());
+    }
     Ok(())
 }
 
 pub fn path(id: &str) -> Result<()> {
     ensure!(!id.is_empty(), "entity id must not be empty");
-    let current = env::current_dir().context("failed to read the current directory")?;
-    let manifest_path = find_manifest(&current)?;
-    let workspace = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", manifest_path.display()))?;
-    let manifest_bytes = fs::read(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest = parse_manifest(&manifest_bytes, &manifest_path)?;
+    let (manifest_path, workspace, manifest) = current_manifest()?;
+    let manifest_bytes = fs::read(&manifest_path)?;
 
-    let lock_path = workspace.join(LOCK_NAME);
+    let lock_path = manifest_path.parent().unwrap().join(LOCK_NAME);
     let lock_bytes = fs::read(&lock_path).with_context(|| {
         format!(
             "failed to read {}; run `ayeque-forge lock` first",
@@ -295,13 +353,15 @@ pub fn path(id: &str) -> Result<()> {
         .iter()
         .find(|entity| entity.id == id)
         .ok_or_else(|| anyhow!("entity {:?} is not present in {}", id, lock_path.display()))?;
-    let data_root = data_root_for(workspace, &manifest)?;
-    let materialized = resolved_entity_path(workspace, &data_root, &manifest, entity)?;
+    let data_root = data_root()?;
+    let materialized = resolved_entity_path(&workspace, &data_root, &manifest, entity)?;
     println!("{}", materialized.display());
     Ok(())
 }
 
 pub fn paths() -> Result<()> {
+    paths_xdg()
+    /*
     let current = env::current_dir().context("failed to read the current directory")?;
     let manifest_path = find_manifest(&current)?;
     let workspace = manifest_path
@@ -336,50 +396,45 @@ pub fn paths() -> Result<()> {
         let materialized = resolved_entity_path(workspace, &data_root, &manifest, entity)?;
         println!("entity.{}	{}", entity.id, materialized.display());
     }
+    Ok(()) */
+}
+
+fn paths_xdg() -> Result<()> {
+    let (manifest_path, workspace, manifest) = current_manifest()?;
+    let manifest_bytes = fs::read(&manifest_path)?;
+    let data_root = data_root()?;
+    let project = manifest_path.parent().unwrap();
+    println!("workspace\t{}", workspace.display());
+    println!("project\t{}", project.display());
+    println!("manifest\t{}", manifest_path.display());
+    println!("lock\t{}", project.join(LOCK_NAME).display());
+    println!("storage\t{}", data_root.display());
+    println!("git-cache\t{}", data_root.join("git").display());
+    println!("projects\t{}", data_root.join("projects").display());
+    println!("entities\t{}", project.join("entities").display());
+    let lock_path = project.join(LOCK_NAME);
+    let lock_bytes = fs::read(&lock_path)?;
+    let lock = parse_lock(&lock_bytes, &lock_path)?;
+    ensure!(
+        lock.manifest_sha256 == format!("sha256:{}", sha256_hex(&manifest_bytes)),
+        "{} is stale; run ayeque-forge lock",
+        lock_path.display()
+    );
+    for entity in &lock.entity {
+        let materialized = data_root
+            .join("projects")
+            .join(&lock.project_key)
+            .join("entities")
+            .join(&entity.id);
+        ensure!(
+            materialized.is_dir(),
+            "locked entity {:?} is not materialized",
+            entity.id
+        );
+        println!("entity.{}\t{}", entity.id, materialized.display());
+    }
+    let _ = manifest;
     Ok(())
-}
-
-fn data_root_for(workspace: &Path, manifest: &Manifest) -> Result<PathBuf> {
-    match manifest
-        .storage
-        .as_ref()
-        .map(|storage| Path::new(&storage.root))
-    {
-        Some(root) if root.is_absolute() => Ok(root.to_path_buf()),
-        Some(root) => Ok(workspace.join(root)),
-        None => data_root(),
-    }
-}
-
-fn artifact_path(workspace: &Path, configured: &str) -> PathBuf {
-    let configured = Path::new(configured);
-    if configured.is_absolute() {
-        configured.to_path_buf()
-    } else {
-        workspace.join(configured)
-    }
-}
-
-fn materialize_artifact(workspace: &Path, configured: &str, source: &Path) -> Result<PathBuf> {
-    let destination = artifact_path(workspace, configured);
-    if let (Ok(source), Ok(destination)) = (source.canonicalize(), destination.canonicalize()) {
-        ensure!(
-            source != destination,
-            "entity artifact path must differ from its managed checkout"
-        );
-    }
-    if destination.exists() {
-        ensure!(
-            destination.is_dir(),
-            "entity artifact path {} is not a directory",
-            destination.display()
-        );
-    } else {
-        fs::create_dir_all(&destination)
-            .with_context(|| format!("failed to create {}", destination.display()))?;
-    }
-    copy_tree(source, &destination)?;
-    Ok(destination)
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -388,6 +443,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     {
         let entry = entry.with_context(|| format!("failed to read {}", source.display()))?;
         let source_path = entry.path();
+        if source_path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
         let destination_path = destination.join(entry.file_name());
         let file_type = entry
             .file_type()
@@ -409,27 +467,6 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn materialized_path(data_root: &Path, entity: &LockEntity) -> Result<PathBuf> {
-    let materialized = data_root
-        .join("checkouts")
-        .join(sha256_hex(entity.git.as_bytes()))
-        .join(&entity.commit)
-        .join(&entity.path)
-        .canonicalize()
-        .with_context(|| {
-            format!(
-                "locked entity {:?} is not materialized; run ayeque-forge lock",
-                entity.id
-            )
-        })?;
-    ensure!(
-        materialized.is_dir(),
-        "locked entity {:?} is not a directory; run ayeque-forge lock",
-        entity.id
-    );
-    Ok(materialized)
-}
-
 fn resolved_entity_path(
     workspace: &Path,
     data_root: &Path,
@@ -441,17 +478,24 @@ fn resolved_entity_path(
         .iter()
         .find(|declared| declared.id == entity.id)
         .ok_or_else(|| anyhow!("entity {:?} is not declared", entity.id))?;
-    if let Some(path) = declared.artifact.as_deref() {
-        let path = artifact_path(workspace, path);
-        ensure!(
-            path.is_dir(),
-            "entity {:?} artifact is not materialized; run ayeque-forge lock",
-            entity.id
-        );
-        Ok(path)
-    } else {
-        materialized_path(data_root, entity)
-    }
+    let project_key = lock_project_key(data_root, workspace)?;
+    let path = data_root
+        .join("projects")
+        .join(project_key)
+        .join("entities")
+        .join(&declared.id);
+    ensure!(
+        path.is_dir(),
+        "entity {:?} is not materialized; run ayeque-forge lock",
+        entity.id
+    );
+    Ok(path)
+}
+
+fn lock_project_key(data_root: &Path, workspace: &Path) -> Result<String> {
+    let (project, key, _) = existing_project(data_root, workspace)?;
+    let _ = project;
+    Ok(key)
 }
 
 fn write_lock(path: &Path, lock: &LockFile) -> Result<()> {
@@ -465,7 +509,19 @@ fn validate_lock_matches(
     lock: &LockFile,
     lock_path: &Path,
     manifest_path: &Path,
+    workspace: &Path,
 ) -> Result<()> {
+    let basename = project_basename(workspace)?;
+    ensure!(
+        lock.project_key == basename || lock.project_key.starts_with(&format!("{}-", basename)),
+        "{} belongs to another project",
+        lock_path.display()
+    );
+    ensure!(
+        lock.workspace_sha256 == workspace_identity(workspace),
+        "{} belongs to another workspace",
+        lock_path.display()
+    );
     let expected_digest = format!("sha256:{}", sha256_hex(manifest_bytes));
     ensure!(
         lock.manifest_sha256 == expected_digest,
@@ -533,20 +589,6 @@ fn validate_object_id(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn find_manifest(start: &Path) -> Result<PathBuf> {
-    for directory in start.ancestors() {
-        let candidate = directory.join(MANIFEST_NAME);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    bail!(
-        "no {} found in {} or its parents",
-        MANIFEST_NAME,
-        start.display()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,8 +596,10 @@ mod tests {
     #[test]
     fn lock_serialization_is_stable() {
         let lock = LockFile {
-            format: 1,
+            format: 2,
             manifest_sha256: "sha256:abc".into(),
+            project_key: "project".into(),
+            workspace_sha256: "sha256:workspace".into(),
             entity: vec![LockEntity {
                 id: "a".into(),
                 git: "/repo".into(),
@@ -566,7 +610,7 @@ mod tests {
         };
         assert_eq!(
             toml::to_string_pretty(&lock).unwrap(),
-            "format = 1\nmanifest_sha256 = \"sha256:abc\"\n\n[[entity]]\nid = \"a\"\ngit = \"/repo\"\ncommit = \"commit\"\npath = \"entity\"\ntree = \"tree\"\n"
+            "format = 2\nmanifest_sha256 = \"sha256:abc\"\nproject_key = \"project\"\nworkspace_sha256 = \"sha256:workspace\"\n\n[[entity]]\nid = \"a\"\ngit = \"/repo\"\ncommit = \"commit\"\npath = \"entity\"\ntree = \"tree\"\n"
         );
     }
 }

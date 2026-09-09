@@ -5,9 +5,41 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Serialize, Deserialize)]
+struct GlobalConfig {
+    format: u32,
+    storage_root: String,
+}
+
+pub(crate) fn config_path() -> Result<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME is set"))?;
+    ensure!(
+        base.is_absolute(),
+        "XDG_CONFIG_HOME or HOME must be absolute"
+    );
+    Ok(base.join("ayeque-forge/config.toml"))
+}
+
 pub(crate) fn data_root() -> Result<PathBuf> {
+    let config = config_path()?;
+    if config.is_file() {
+        let bytes = fs::read(&config)?;
+        let config: GlobalConfig =
+            toml::from_slice(&bytes).context("invalid ayeque-forge config")?;
+        ensure!(config.format == 1, "unsupported ayeque-forge config format");
+        let root = PathBuf::from(config.storage_root);
+        ensure!(
+            root.is_absolute(),
+            "configured storage_root must be absolute"
+        );
+        return Ok(root);
+    }
     if let Some(value) = env::var_os("XDG_DATA_HOME") {
         let path = PathBuf::from(value);
         ensure!(path.is_absolute(), "XDG_DATA_HOME must be an absolute path");
@@ -20,8 +52,22 @@ pub(crate) fn data_root() -> Result<PathBuf> {
     Ok(home.join(".local/share/ayeque-forge"))
 }
 
+pub(crate) fn write_storage_root(root: &Path) -> Result<PathBuf> {
+    ensure!(root.is_absolute(), "storage root override must be absolute");
+    let path = config_path()?;
+    let parent = path.parent().unwrap();
+    fs::create_dir_all(parent)?;
+    let config = GlobalConfig {
+        format: 1,
+        storage_root: root.to_string_lossy().into_owned(),
+    };
+    let bytes = toml::to_string_pretty(&config).context("failed to serialize config")?;
+    atomic_write(&path, bytes.as_bytes())?;
+    Ok(path)
+}
+
 pub(crate) fn ensure_layout(root: &Path) -> Result<()> {
-    for directory in [root, &root.join("git"), &root.join("checkouts")] {
+    for directory in [root, &root.join("git"), &root.join("projects")] {
         fs::create_dir_all(directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
     }

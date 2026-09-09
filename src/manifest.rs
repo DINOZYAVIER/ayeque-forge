@@ -4,14 +4,12 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Manifest {
     pub(crate) format: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) storage: Option<Storage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) entity: Vec<ManifestEntity>,
 }
@@ -24,15 +22,11 @@ pub(crate) struct ManifestEntity {
     pub(crate) schema: String,
     pub(crate) git: String,
     pub(crate) revision: String,
+    #[serde(
+        default = "default_entity_path",
+        skip_serializing_if = "is_current_path"
+    )]
     pub(crate) path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) artifact: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Storage {
-    pub(crate) root: String,
 }
 
 pub(crate) fn parse_manifest(bytes: &[u8], path: &Path) -> Result<Manifest> {
@@ -45,14 +39,6 @@ pub(crate) fn parse_manifest(bytes: &[u8], path: &Path) -> Result<Manifest> {
         "unsupported FORGE.toml format {}",
         manifest.format
     );
-    if let Some(storage) = &manifest.storage {
-        ensure!(!storage.root.is_empty(), "storage root must not be empty");
-        ensure!(
-            !storage.root.contains(['\0', '\n', '\r']),
-            "storage root contains an invalid character"
-        );
-    }
-
     let mut ids = BTreeSet::new();
     for entity in &manifest.entity {
         validate_entity(entity)?;
@@ -91,10 +77,14 @@ fn validate_entity(entity: &ManifestEntity) -> Result<()> {
     );
     validate_git_source(&entity.git)?;
     validate_relative_path(&entity.path)?;
-    if let Some(artifact) = &entity.artifact {
-        validate_artifact_path(artifact)?;
-    }
     Ok(())
+}
+
+fn default_entity_path() -> String {
+    ".".into()
+}
+fn is_current_path(path: &str) -> bool {
+    path == "."
 }
 
 fn validate_git_source(source: &str) -> Result<()> {
@@ -126,24 +116,14 @@ pub(crate) fn validate_relative_path(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_artifact_path(value: &str) -> Result<()> {
-    ensure!(!value.is_empty(), "entity artifact path must not be empty");
-    ensure!(
-        !value.contains(['\0', '\n', '\r']),
-        "entity artifact path contains an invalid character"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn empty_manifest_is_valid() {
-        let manifest = parse_manifest(b"format = 1\n", Path::new("FORGE.toml")).unwrap();
+        let manifest = parse_manifest(b"format = 2\n", Path::new("FORGE.toml")).unwrap();
         assert!(manifest.entity.is_empty());
-        assert!(manifest.storage.is_none());
     }
 
     #[test]
@@ -156,7 +136,7 @@ mod tests {
     #[test]
     fn manifest_rejects_duplicate_ids() {
         let source = br#"
-format = 1
+format = 2
 
 [[entity]]
 id = "same"
@@ -184,13 +164,5 @@ path = "second"
         assert!(validate_relative_path("/absolute").is_err());
         assert!(validate_relative_path("entity").is_ok());
         assert!(validate_relative_path(".").is_ok());
-    }
-
-    #[test]
-    fn storage_root_accepts_absolute_and_relative_paths() {
-        for root in ["/tmp/forge-data", ".forge-data", "../forge-data"] {
-            let source = format!("format = 1\n[storage]\nroot = \"{root}\"\n");
-            assert!(parse_manifest(source.as_bytes(), Path::new("FORGE.toml")).is_ok());
-        }
     }
 }
