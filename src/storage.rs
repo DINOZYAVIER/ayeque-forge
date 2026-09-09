@@ -20,6 +20,14 @@ pub(crate) fn data_root() -> Result<PathBuf> {
     Ok(home.join(".local/share/ayeque-forge"))
 }
 
+pub(crate) fn ensure_layout(root: &Path) -> Result<()> {
+    for directory in [root, &root.join("git"), &root.join("checkouts")] {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
