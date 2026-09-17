@@ -63,7 +63,16 @@ name = "ayeque-forge"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
+ "ayeque-forge-core",
  "clap",
+ "tempfile",
+]
+
+[[package]]
+name = "ayeque-forge-core"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
  "serde",
  "sha2",
  "tempfile",

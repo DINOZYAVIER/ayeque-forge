@@ -1,6 +1,5 @@
 mod forge;
 mod git;
-mod manifest;
 mod storage;
 
 use anyhow::Result;

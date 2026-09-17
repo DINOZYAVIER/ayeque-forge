@@ -1,6 +1,8 @@
 use std::fs;
 use std::process::Command;
 
+use ayeque_forge_core::{LockEntry, resolve_entity, resolve_project_at, serialize_lock};
+
 fn forge() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ayeque-forge"))
 }
@@ -54,5 +56,69 @@ fn config_storage_root_is_global_and_absolute() {
         temp.path()
             .join("config/ayeque-forge/config.toml")
             .is_file()
+    );
+}
+
+#[test]
+fn cli_and_core_resolve_the_same_verified_entity_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let data_home = temp.path().join("data");
+    let config_home = temp.path().join("config");
+    fs::create_dir(&workspace).unwrap();
+    let environment = |command: &mut Command| {
+        command
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("HOME", temp.path())
+            .current_dir(&workspace);
+    };
+
+    let mut init = forge();
+    init.arg("init").arg(&workspace);
+    environment(&mut init);
+    let output = init.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let storage = data_home.join("ayeque-forge");
+    let project = resolve_project_at(&storage, &workspace).unwrap();
+    fs::write(
+        project.manifest_path(),
+        "format = 2\n[[entity]]\nid = \"agent\"\nkind = \"agent\"\nschema = \"1\"\ngit = \"/repo\"\nrevision = \"main\"\n",
+    )
+    .unwrap();
+    let project = resolve_project_at(&storage, &workspace).unwrap();
+    fs::create_dir_all(project.entities_path().join("agent")).unwrap();
+    let entry = LockEntry::new(
+        "agent".into(),
+        "/repo".into(),
+        "0123456789012345678901234567890123456789".into(),
+        ".".into(),
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+    )
+    .unwrap();
+    fs::write(
+        project.lock_path(),
+        serialize_lock(&project, vec![entry]).unwrap(),
+    )
+    .unwrap();
+
+    let core_entity = resolve_entity(&project, "agent").unwrap();
+    let mut path = forge();
+    path.arg("path").arg("agent");
+    environment(&mut path);
+    let output = path.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        core_entity.materialized_path().to_str().unwrap()
     );
 }
