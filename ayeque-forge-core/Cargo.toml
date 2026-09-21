@@ -2,7 +2,7 @@
 name = "ayeque-forge-core"
 version = "0.1.0-alpha.1"
 edition = "2024"
-license = "Apache-2.0"
+license = "LGPL-3.0-or-later"
 description = "Verified project, manifest, lock, and entity resolution for Ayeque Forge"
 repository = "https://github.com/DINOZYAVIER/ayeque-forge"
 
