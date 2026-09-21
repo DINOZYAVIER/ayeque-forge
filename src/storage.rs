@@ -3,26 +3,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 
 pub(crate) fn sibling_temporary(path: &Path) -> PathBuf {
     let mut name = OsString::from(".");
     name.push(path.file_name().unwrap_or_else(|| OsStr::new("forge")));
     name.push(format!(".tmp-{}", std::process::id()));
     path.with_file_name(name)
-}
-
-pub(crate) fn remove_internal_path_if_present(path: &Path, required_parent: &Path) -> Result<()> {
-    ensure!(
-        path.parent() == Some(required_parent),
-        "refusing to remove an unmanaged path"
-    );
-    if path.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

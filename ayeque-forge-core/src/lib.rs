@@ -6,13 +6,17 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod git;
 
 const MANIFEST_NAME: &str = "FORGE.toml";
 const LOCK_NAME: &str = "FORGE.lock";
 const PROJECT_MARKER_NAME: &str = "project.toml";
 const FORMAT: u32 = 2;
+const TRANSACTION_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ProjectLocation {
@@ -62,7 +66,66 @@ pub struct ManifestEntity {
     path: String,
 }
 
+/// Entity declaration accepted by the native registration API.
+#[derive(Debug, Clone)]
+pub struct EntityRegistration {
+    id: String,
+    kind: String,
+    schema: String,
+    git: String,
+    revision: String,
+    path: String,
+}
+
 impl ManifestEntity {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+    pub fn git(&self) -> &str {
+        &self.git
+    }
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl EntityRegistration {
+    pub fn new(
+        id: String,
+        kind: String,
+        schema: String,
+        git: String,
+        revision: String,
+        path: String,
+    ) -> Result<Self> {
+        let entity = ManifestEntityFile {
+            id,
+            kind,
+            schema,
+            git,
+            revision,
+            path,
+        };
+        validate_manifest_entity(&entity)?;
+        Ok(Self {
+            id: entity.id,
+            kind: entity.kind,
+            schema: entity.schema,
+            git: entity.git,
+            revision: entity.revision,
+            path: entity.path,
+        })
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -603,8 +666,10 @@ pub fn verify_lock(project: &VerifiedProject) -> Result<VerifiedLock> {
     );
     for entity in &entities {
         let path = project.entities_path.join(entity.id());
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect materialized entity {:?}", entity.id()))?;
         ensure!(
-            path.is_dir(),
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
             "entity {:?} is not materialized; run `ayeque-forge lock`",
             entity.id()
         );
@@ -621,7 +686,7 @@ pub fn verify_lock(project: &VerifiedProject) -> Result<VerifiedLock> {
             name
         );
         ensure!(
-            entry.file_type()?.is_dir(),
+            entry.file_type()?.is_dir() && !entry.file_type()?.is_symlink(),
             "materialized entity {:?} is not a directory; run `ayeque-forge lock`",
             name
         );
@@ -649,8 +714,10 @@ pub fn resolve_entity(project: &VerifiedProject, entity_id: &str) -> Result<Veri
         })?;
     let declared = project.manifest_entity(entity_id)?;
     let materialized_path = project.entities_path.join(entity_id);
+    let metadata = fs::symlink_metadata(&materialized_path)
+        .with_context(|| format!("failed to inspect materialized entity {:?}", entity_id))?;
     ensure!(
-        materialized_path.is_dir(),
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
         "entity {:?} is not materialized; run `ayeque-forge lock`",
         entity_id
     );
@@ -664,6 +731,586 @@ pub fn resolve_entity(project: &VerifiedProject, entity_id: &str) -> Result<Veri
         tree: locked.tree.clone(),
         materialized_path,
     })
+}
+
+/// Add one declaration and refresh its lock/materialization as one project transaction.
+pub fn register_entity(
+    project: &VerifiedProject,
+    registration: EntityRegistration,
+) -> Result<VerifiedProject> {
+    let _mutation_lock = MutationLock::acquire(project)?;
+    ensure_project_current(project)?;
+    ensure!(
+        project
+            .manifest
+            .entities()
+            .iter()
+            .all(|entity| entity.id() != registration.id()),
+        "entity {:?} is already declared",
+        registration.id()
+    );
+
+    let reusable = verify_lock(project).ok();
+    let mut manifest = project.manifest.clone();
+    manifest.entity.push(ManifestEntity {
+        id: registration.id,
+        kind: registration.kind,
+        schema: registration.schema,
+        git: registration.git,
+        revision: registration.revision,
+        path: registration.path,
+    });
+    let manifest_bytes = serialize_manifest(&manifest)?;
+    refresh_lock_transaction(project, manifest, manifest_bytes, reusable.as_ref())
+}
+
+/// Refresh the lock and materialized entities for a project.
+pub fn refresh_lock(project: &VerifiedProject) -> Result<VerifiedProject> {
+    let _mutation_lock = MutationLock::acquire(project)?;
+    ensure_project_current(project)?;
+    let reusable = verify_lock(project).ok();
+    refresh_lock_transaction(
+        project,
+        project.manifest.clone(),
+        project.manifest_bytes.clone(),
+        reusable.as_ref(),
+    )
+}
+
+/// Advance one declared entity to a new revision and refresh its materialization.
+pub fn advance_entity_revision(
+    project: &VerifiedProject,
+    id: &str,
+    expected_old_commit: &str,
+    new_revision: &str,
+) -> Result<VerifiedProject> {
+    let _mutation_lock = MutationLock::acquire(project)?;
+    ensure_project_current(project)?;
+    validate_revision(new_revision)?;
+
+    let lock = verify_lock(project)?;
+    let locked = lock
+        .entities()
+        .iter()
+        .find(|entry| entry.id() == id)
+        .ok_or_else(|| anyhow!("entity {:?} is not locked", id))?;
+    ensure!(
+        locked.commit() == expected_old_commit,
+        "entity {:?} is not at expected commit",
+        id
+    );
+
+    let mut manifest = project.manifest.clone();
+    let declaration = manifest
+        .entity
+        .iter_mut()
+        .find(|entity| entity.id() == id)
+        .ok_or_else(|| anyhow!("entity {:?} is not declared", id))?;
+    declaration.revision = new_revision.to_owned();
+    let manifest_bytes = serialize_manifest(&manifest)?;
+    refresh_lock_transaction(project, manifest, manifest_bytes, Some(&lock))
+}
+
+fn refresh_lock_transaction(
+    project: &VerifiedProject,
+    manifest: Manifest,
+    manifest_bytes: Vec<u8>,
+    reusable: Option<&VerifiedLock>,
+) -> Result<VerifiedProject> {
+    ensure!(
+        project.entities_path.is_dir(),
+        "{} is not a materialized entities directory",
+        project.entities_path.display()
+    );
+    let prepared = project_with_manifest(project, manifest_bytes.clone(), manifest);
+    let transaction = Transaction::new(project)?;
+    let result = (|| -> Result<VerifiedProject> {
+        let mut declarations = prepared.manifest.entities().to_vec();
+        declarations.sort_by(|left, right| left.id().cmp(right.id()));
+        let mut repositories = std::collections::BTreeMap::<String, PathBuf>::new();
+        let mut locked = Vec::with_capacity(declarations.len());
+        let mut staged_ids = Vec::new();
+
+        for declaration in declarations {
+            if let Some(entry) = reusable
+                .and_then(|lock| {
+                    lock.entities
+                        .iter()
+                        .find(|entry| entry.id() == declaration.id())
+                })
+                .filter(|entry| {
+                    let old_declaration = project.manifest_entity(entry.id()).ok();
+                    old_declaration.is_some_and(|old| {
+                        old.revision() == declaration.revision()
+                            && old.kind() == declaration.kind()
+                            && old.schema() == declaration.schema()
+                    }) && entry.git() == declaration.git()
+                        && entry.path() == declaration.path()
+                        && project.entities_path.join(entry.id()).is_dir()
+                })
+            {
+                locked.push(LockEntry::new(
+                    entry.id().to_owned(),
+                    entry.git().to_owned(),
+                    entry.commit().to_owned(),
+                    entry.path().to_owned(),
+                    entry.tree().to_owned(),
+                )?);
+                continue;
+            }
+
+            let source_hash = sha256_hex(declaration.git().as_bytes());
+            let repository = match repositories.get(declaration.git()) {
+                Some(path) => path.clone(),
+                None => {
+                    let path = git::ensure_repository(
+                        project.storage_root(),
+                        &source_hash,
+                        declaration.git(),
+                    )?;
+                    repositories.insert(declaration.git().to_owned(), path.clone());
+                    path
+                }
+            };
+            let commit =
+                git::fetch_revision(&repository, declaration.git(), declaration.revision())
+                    .with_context(|| format!("failed to resolve entity {:?}", declaration.id()))?;
+            let tree = git::resolve_tree(&repository, &commit, declaration.path())
+                .with_context(|| format!("invalid tree for entity {:?}", declaration.id()))?;
+            git::fetch_lfs(&repository, &commit, declaration.path(), &tree.lfs)?;
+            let checkout =
+                git::ensure_checkout(project.storage_root(), &source_hash, &commit, &repository)?;
+            git::materialize_lfs(&checkout, declaration.path(), &tree.lfs)?;
+            let checkout_entity = checkout.join(declaration.path());
+            ensure!(
+                checkout_entity.is_dir(),
+                "materialized entity {:?} is not a directory",
+                declaration.id()
+            );
+            let staged = transaction.staged_entities.join(declaration.id());
+            fs::create_dir_all(&staged)?;
+            copy_tree(&checkout_entity, &staged)?;
+            staged_ids.push(declaration.id().to_owned());
+            locked.push(LockEntry::new(
+                declaration.id().to_owned(),
+                declaration.git().to_owned(),
+                commit,
+                declaration.path().to_owned(),
+                tree.id,
+            )?);
+        }
+
+        let lock_bytes = serialize_lock(&prepared, locked)?;
+        write_staged_file(&transaction.manifest, &manifest_bytes)?;
+        write_staged_file(&transaction.lock, &lock_bytes)?;
+        transaction.commit(&staged_ids)?;
+        Ok(prepared)
+    })();
+
+    match result {
+        Ok(project) => {
+            transaction.cleanup()?;
+            Ok(project)
+        }
+        Err(error) => {
+            let rollback = transaction.rollback();
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow!(
+                    "Forge transaction failed: {error}; rollback also failed: {rollback_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn project_with_manifest(
+    project: &VerifiedProject,
+    manifest_bytes: Vec<u8>,
+    manifest: Manifest,
+) -> VerifiedProject {
+    VerifiedProject {
+        storage_root: project.storage_root.clone(),
+        project_path: project.project_path.clone(),
+        project_key: project.project_key.clone(),
+        workspace: project.workspace.clone(),
+        workspace_sha256: project.workspace_sha256.clone(),
+        manifest_path: project.manifest_path.clone(),
+        lock_path: project.lock_path.clone(),
+        entities_path: project.entities_path.clone(),
+        manifest_bytes,
+        manifest,
+    }
+}
+
+fn serialize_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
+    let file = ManifestFile {
+        format: manifest.format,
+        entity: manifest
+            .entities()
+            .iter()
+            .map(|entity| ManifestEntityFile {
+                id: entity.id.clone(),
+                kind: entity.kind.clone(),
+                schema: entity.schema.clone(),
+                git: entity.git.clone(),
+                revision: entity.revision.clone(),
+                path: entity.path.clone(),
+            })
+            .collect(),
+    };
+    Ok(toml::to_string_pretty(&file)
+        .context("failed to serialize FORGE.toml")?
+        .into_bytes())
+}
+
+fn ensure_project_current(project: &VerifiedProject) -> Result<()> {
+    ensure!(
+        marker_matches(
+            &project.project_path.join(PROJECT_MARKER_NAME),
+            &project.workspace_sha256
+        )?,
+        "{} belongs to another workspace",
+        project.project_path.display()
+    );
+    let current_manifest = fs::read(&project.manifest_path)
+        .with_context(|| format!("failed to read {}", project.manifest_path.display()))?;
+    ensure!(
+        current_manifest == project.manifest_bytes,
+        "{} is stale; resolve the project again",
+        project.manifest_path.display()
+    );
+    Ok(())
+}
+
+fn validate_revision(value: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "entity revision must not be empty");
+    ensure!(
+        !value.contains(['\0', '\n', '\r']),
+        "entity revision contains an invalid character"
+    );
+    ensure!(
+        !value.starts_with('-'),
+        "entity revision must not start with '-'"
+    );
+    Ok(())
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", source.display()))?;
+        let source_path = entry.path();
+        if source_path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+        ensure!(
+            !file_type.is_symlink(),
+            "entity tree contains unsupported symlink {}",
+            source_path.display()
+        );
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination_path)
+                .with_context(|| format!("failed to create {}", destination_path.display()))?;
+            copy_tree(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_staged_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+struct Transaction {
+    root: PathBuf,
+    staged_entities: PathBuf,
+    manifest: PathBuf,
+    lock: PathBuf,
+    journal: PathBuf,
+    project_path: PathBuf,
+    entities_path: PathBuf,
+    backups: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
+    installed: std::cell::RefCell<Vec<PathBuf>>,
+}
+
+struct MutationLock {
+    _file: fs::File,
+}
+
+impl MutationLock {
+    fn acquire(project: &VerifiedProject) -> Result<Self> {
+        let path = project.project_path.join(".forge-mutation.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to acquire Forge mutation lock {}", path.display()))?;
+        file.try_lock_exclusive()
+            .with_context(|| format!("failed to acquire Forge mutation lock {}", path.display()))?;
+        let lock = Self { _file: file };
+        recover_transactions(&project.project_path)?;
+        Ok(lock)
+    }
+}
+
+impl Transaction {
+    fn new(project: &VerifiedProject) -> Result<Self> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = project
+            .project_path
+            .join(format!(".forge-transaction-{}-{id}", std::process::id()));
+        ensure!(
+            !root.exists(),
+            "Forge transaction path already exists: {}",
+            root.display()
+        );
+        fs::create_dir_all(root.join("entities"))?;
+        Ok(Self {
+            staged_entities: root.join("entities"),
+            manifest: root.join(MANIFEST_NAME),
+            lock: root.join(LOCK_NAME),
+            journal: root.join("journal.toml"),
+            root,
+            project_path: project.project_path.clone(),
+            entities_path: project.entities_path.clone(),
+            backups: std::cell::RefCell::new(Vec::new()),
+            installed: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    fn commit(&self, staged_ids: &[String]) -> Result<()> {
+        write_transaction_journal(&self.journal, staged_ids)?;
+        let mut targets = vec![
+            (
+                self.project_path.join(MANIFEST_NAME),
+                self.root.join("manifest.previous"),
+            ),
+            (
+                self.project_path.join(LOCK_NAME),
+                self.root.join("lock.previous"),
+            ),
+        ];
+        for id in staged_ids {
+            targets.push((
+                self.entities_path.join(id),
+                self.root.join(format!("entity-{id}.previous")),
+            ));
+        }
+        for (target, backup) in targets {
+            if target.exists() {
+                fs::rename(&target, &backup).with_context(|| {
+                    format!(
+                        "failed to stage existing {} for replacement",
+                        target.display()
+                    )
+                })?;
+                self.backups.borrow_mut().push((target, backup));
+            }
+        }
+
+        let mut installs = vec![
+            (self.manifest.clone(), self.project_path.join(MANIFEST_NAME)),
+            (self.lock.clone(), self.project_path.join(LOCK_NAME)),
+        ];
+        for id in staged_ids {
+            installs.push((self.staged_entities.join(id), self.entities_path.join(id)));
+        }
+        for (staged, target) in installs {
+            fs::rename(&staged, &target)
+                .with_context(|| format!("failed to install {}", target.display()))?;
+            self.installed.borrow_mut().push(target);
+        }
+        Ok(())
+    }
+
+    fn rollback(&self) -> Result<()> {
+        let mut errors = Vec::new();
+        for target in self.installed.borrow().iter().rev() {
+            if let Err(error) = remove_path(target) {
+                errors.push(error.to_string());
+            }
+        }
+        for (target, backup) in self.backups.borrow().iter().rev() {
+            if backup.exists() {
+                if let Err(error) = fs::rename(backup, target) {
+                    errors.push(error.to_string());
+                }
+            }
+        }
+        if let Err(error) = remove_path(&self.root) {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        remove_path(&self.root)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TransactionJournal {
+    format: u32,
+    staged_ids: Vec<String>,
+}
+
+fn write_transaction_journal(path: &Path, staged_ids: &[String]) -> Result<()> {
+    for id in staged_ids {
+        validate_entity_id(id)?;
+    }
+    let journal = TransactionJournal {
+        format: TRANSACTION_FORMAT,
+        staged_ids: staged_ids.to_vec(),
+    };
+    let bytes = toml::to_string_pretty(&journal)
+        .context("failed to serialize Forge transaction journal")?
+        .into_bytes();
+    atomic_write(path, &bytes)
+}
+
+fn recover_transactions(project_path: &Path) -> Result<()> {
+    let entries = fs::read_dir(project_path)
+        .with_context(|| format!("failed to inspect {}", project_path.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".forge-transaction-") {
+            continue;
+        }
+        ensure!(
+            entry.file_type()?.is_dir(),
+            "Forge transaction path is not a directory: {}",
+            entry.path().display()
+        );
+        recover_transaction(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn recover_transaction(root: &Path) -> Result<()> {
+    let journal_path = root.join("journal.toml");
+    if !journal_path.exists() {
+        // The process died before commit started; no project path was changed.
+        return remove_path(root);
+    }
+    let bytes = fs::read(&journal_path)
+        .with_context(|| format!("failed to read {}", journal_path.display()))?;
+    let source = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is not UTF-8", journal_path.display()))?;
+    let journal: TransactionJournal = toml::from_str(source)
+        .with_context(|| format!("failed to parse {}", journal_path.display()))?;
+    ensure!(
+        journal.format == TRANSACTION_FORMAT,
+        "unsupported Forge transaction journal format {}",
+        journal.format
+    );
+    for id in &journal.staged_ids {
+        validate_entity_id(id)?;
+    }
+
+    let project_path = root
+        .parent()
+        .ok_or_else(|| anyhow!("Forge transaction has no project parent"))?;
+    let mut targets = vec![
+        (
+            project_path.join(MANIFEST_NAME),
+            root.join("manifest.previous"),
+            None,
+        ),
+        (
+            project_path.join(LOCK_NAME),
+            root.join("lock.previous"),
+            None,
+        ),
+    ];
+    targets.extend(journal.staged_ids.iter().map(|id| {
+        (
+            project_path.join("entities").join(id),
+            root.join(format!("entity-{id}.previous")),
+            Some(id.as_str()),
+        )
+    }));
+
+    for (target, backup, staged_id) in targets {
+        if backup.exists() {
+            if target.exists() {
+                remove_path(&target)?;
+            }
+            fs::rename(&backup, &target).with_context(|| {
+                format!(
+                    "failed to restore {} from {}",
+                    target.display(),
+                    backup.display()
+                )
+            })?;
+            continue;
+        }
+
+        let staged = match staged_id {
+            Some(id) => root.join("entities").join(id),
+            None if target.file_name() == Some(OsStr::new(MANIFEST_NAME)) => {
+                root.join(MANIFEST_NAME)
+            }
+            None => root.join(LOCK_NAME),
+        };
+        if !staged.exists() && target.exists() {
+            remove_path(&target)?;
+        }
+    }
+
+    remove_path(root)
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn remove_internal_path_if_present(path: &Path, required_parent: &Path) -> Result<()> {
+    ensure!(
+        path.parent() == Some(required_parent),
+        "refusing to remove an unmanaged path"
+    );
+    remove_path(path)
 }
 
 pub fn serialize_lock(project: &VerifiedProject, entities: Vec<LockEntry>) -> Result<Vec<u8>> {
@@ -891,6 +1538,7 @@ fn sibling_temporary(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn manifest_parser_is_strict_and_rejects_unsafe_ids() {
@@ -906,6 +1554,60 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_rejects_symlinks_without_copying_them() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&outside, "outside\n").unwrap();
+        symlink(&outside, source.join("escape.txt")).unwrap();
+
+        let error = copy_tree(&source, &destination).unwrap_err().to_string();
+        assert!(error.contains("unsupported symlink"));
+        assert!(!destination.join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_lock_rejects_a_symlinked_entity_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let storage = temp.path().join("data");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(
+            location.project_path().join(MANIFEST_NAME),
+            "format = 2\n[[entity]]\nid = \"agent\"\nkind = \"agent\"\nschema = \"1\"\ngit = \"/repo\"\nrevision = \"main\"\n",
+        )
+        .unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let entry = LockEntry::new(
+            "agent".into(),
+            "/repo".into(),
+            "0123456789012345678901234567890123456789".into(),
+            ".".into(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+        )
+        .unwrap();
+        symlink(&outside, project.entities_path().join("agent")).unwrap();
+        fs::write(
+            project.lock_path(),
+            serialize_lock(&project, vec![entry]).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_lock(&project).is_err());
     }
 
     #[test]
@@ -954,5 +1656,428 @@ mod tests {
         assert!(verify_lock(&project).is_err());
         fs::write(project.lock_path(), "format = 2\nmanifest_sha256 = \"sha256:stale\"\nproject_key = \"workspace\"\nworkspace_sha256 = \"sha256:stale\"\n").unwrap();
         assert!(verify_lock(&project).is_err());
+    }
+
+    #[test]
+    fn registration_materializes_and_preserves_verified_entities() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let source = temp.path().join("source");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(source.join("one")).unwrap();
+        fs::write(source.join("one/value.txt"), "one\n").unwrap();
+        git_test(&source, ["init", "--quiet"]);
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "one",
+            ],
+        );
+
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let first = EntityRegistration::new(
+            "first".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            "HEAD".into(),
+            "one".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, first).unwrap();
+        assert_eq!(
+            fs::read_to_string(project.entities_path().join("first/value.txt")).unwrap(),
+            "one\n"
+        );
+
+        fs::create_dir_all(source.join("two")).unwrap();
+        fs::write(source.join("two/value.txt"), "two\n").unwrap();
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "two",
+            ],
+        );
+        let second = EntityRegistration::new(
+            "second".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            "HEAD".into(),
+            "two".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, second).unwrap();
+        assert_eq!(
+            fs::read_to_string(project.entities_path().join("first/value.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(project.entities_path().join("second/value.txt")).unwrap(),
+            "two\n"
+        );
+        assert_eq!(verify_lock(&project).unwrap().entities().len(), 2);
+        assert!(fs::read_dir(project.project_path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".forge-transaction-")
+        }));
+    }
+
+    #[test]
+    fn refresh_lock_does_not_reuse_materialization_when_revision_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let source = temp.path().join("source");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(source.join("entity")).unwrap();
+        fs::write(source.join("entity/value.txt"), "old\n").unwrap();
+        git_test(&source, ["init", "--quiet"]);
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "old",
+            ],
+        );
+        let old_revision = git_test_output(&source, ["rev-parse", "HEAD"]);
+
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let registration = EntityRegistration::new(
+            "changed".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            old_revision,
+            "entity".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, registration).unwrap();
+
+        fs::write(source.join("entity/value.txt"), "new\n").unwrap();
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "new",
+            ],
+        );
+        let new_revision = git_test_output(&source, ["rev-parse", "HEAD"]);
+        let mut changed_manifest = project.manifest.clone();
+        changed_manifest.entity[0].revision = new_revision;
+        fs::write(
+            project.manifest_path(),
+            serialize_manifest(&changed_manifest).unwrap(),
+        )
+        .unwrap();
+        let stale = resolve_project_at(&storage, &workspace).unwrap();
+        let refreshed = refresh_lock(&stale).unwrap();
+        assert_eq!(
+            fs::read_to_string(refreshed.entities_path().join("changed/value.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn advance_revision_checks_expected_commit_and_preserves_unchanged_entities() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let source = temp.path().join("source");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(source.join("changed")).unwrap();
+        fs::create_dir_all(source.join("unchanged")).unwrap();
+        fs::write(source.join("changed/value.txt"), "old\n").unwrap();
+        fs::write(source.join("unchanged/value.txt"), "keep\n").unwrap();
+        git_test(&source, ["init", "--quiet"]);
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "old",
+            ],
+        );
+        let old_revision = git_test_output(&source, ["rev-parse", "HEAD"]);
+
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let changed = EntityRegistration::new(
+            "changed".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            old_revision.clone(),
+            "changed".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, changed).unwrap();
+        let unchanged = EntityRegistration::new(
+            "unchanged".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            old_revision.clone(),
+            "unchanged".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, unchanged).unwrap();
+        fs::write(
+            project.entities_path().join("unchanged/agent-local-marker"),
+            "preserve\n",
+        )
+        .unwrap();
+        let stale = resolve_project_at(&storage, &workspace).unwrap();
+
+        fs::write(source.join("changed/value.txt"), "new\n").unwrap();
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "new",
+            ],
+        );
+        let new_revision = git_test_output(&source, ["rev-parse", "HEAD"]);
+
+        assert!(advance_entity_revision(&project, "changed", "wrong", &new_revision).is_err());
+        assert_eq!(
+            fs::read(project.manifest_path()).unwrap(),
+            project.manifest_bytes()
+        );
+
+        let advanced =
+            advance_entity_revision(&project, "changed", &old_revision, &new_revision).unwrap();
+        assert_eq!(
+            fs::read_to_string(advanced.entities_path().join("changed/value.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                advanced
+                    .entities_path()
+                    .join("unchanged/agent-local-marker")
+            )
+            .unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            resolve_entity(&advanced, "changed").unwrap().commit(),
+            new_revision
+        );
+        assert_eq!(
+            resolve_entity(&advanced, "unchanged").unwrap().commit(),
+            old_revision
+        );
+
+        let stale_error = advance_entity_revision(&stale, "changed", &old_revision, &new_revision)
+            .unwrap_err()
+            .to_string();
+        assert!(stale_error.contains("is stale"));
+    }
+
+    #[test]
+    fn mutation_lock_rejects_concurrent_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let lock_path = project.project_path().join(".forge-mutation.lock");
+        let _lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        _lock.try_lock_exclusive().unwrap();
+        let error = refresh_lock(&project).unwrap_err().to_string();
+        assert!(error.contains("failed to acquire Forge mutation lock"));
+    }
+
+    #[test]
+    fn mutation_lock_recovers_an_interrupted_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        fs::write(
+            project.lock_path(),
+            serialize_lock(&project, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        let old_manifest = fs::read(project.manifest_path()).unwrap();
+        let old_lock = fs::read(project.lock_path()).unwrap();
+
+        let transaction = project.project_path().join(".forge-transaction-crash-test");
+        fs::create_dir_all(transaction.join("entities")).unwrap();
+        fs::rename(
+            project.manifest_path(),
+            transaction.join("manifest.previous"),
+        )
+        .unwrap();
+        fs::rename(project.lock_path(), transaction.join("lock.previous")).unwrap();
+        fs::write(
+            transaction.join(MANIFEST_NAME),
+            "format = 2\n[[entity]]\nid = \"partial\"\nkind = \"document\"\nschema = \"agentlibre.document/v1\"\ngit = \"/repo\"\nrevision = \"main\"\n",
+        )
+        .unwrap();
+        fs::write(transaction.join(LOCK_NAME), "partial lock\n").unwrap();
+        fs::write(
+            transaction.join("journal.toml"),
+            "format = 1\nstaged_ids = [\"partial\"]\n",
+        )
+        .unwrap();
+        fs::rename(transaction.join(MANIFEST_NAME), project.manifest_path()).unwrap();
+        fs::rename(transaction.join(LOCK_NAME), project.lock_path()).unwrap();
+
+        let _lock = MutationLock::acquire(&project).unwrap();
+        assert_eq!(fs::read(project.manifest_path()).unwrap(), old_manifest);
+        assert_eq!(fs::read(project.lock_path()).unwrap(), old_lock);
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn failed_registration_rolls_back_before_project_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let source = temp.path().join("source");
+        let storage = temp.path().join("data");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(source.join("valid")).unwrap();
+        fs::write(source.join("valid/value.txt"), "valid\n").unwrap();
+        fs::write(source.join("not-a-directory"), "file\n").unwrap();
+        git_test(&source, ["init", "--quiet"]);
+        git_test(&source, ["add", "."]);
+        git_test(
+            &source,
+            [
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        );
+        let location = initialize_project(&storage, &workspace).unwrap();
+        fs::write(location.project_path().join(MANIFEST_NAME), "format = 2\n").unwrap();
+        let project = resolve_project_at(&storage, &workspace).unwrap();
+        let valid = EntityRegistration::new(
+            "valid".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            "HEAD".into(),
+            "valid".into(),
+        )
+        .unwrap();
+        let project = register_entity(&project, valid).unwrap();
+        let before_manifest = fs::read(project.manifest_path()).unwrap();
+        let before_entity =
+            fs::read_to_string(project.entities_path().join("valid/value.txt")).unwrap();
+        let invalid = EntityRegistration::new(
+            "invalid".into(),
+            "document".into(),
+            "agentlibre.document/v1".into(),
+            source.to_string_lossy().into_owned(),
+            "HEAD".into(),
+            "not-a-directory".into(),
+        )
+        .unwrap();
+        assert!(register_entity(&project, invalid).is_err());
+        assert_eq!(fs::read(project.manifest_path()).unwrap(), before_manifest);
+        assert_eq!(
+            fs::read_to_string(project.entities_path().join("valid/value.txt")).unwrap(),
+            before_entity
+        );
+        assert!(project.lock_path().is_file());
+    }
+
+    fn git_test<const N: usize>(directory: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_test_output<const N: usize>(directory: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 }
